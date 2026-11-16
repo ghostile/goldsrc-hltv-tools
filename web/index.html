@@ -34,12 +34,42 @@
       <button data-tab="kills">Kills</button>
       <button data-tab="chat">Chat</button>
       <button data-tab="sus">Review</button>
+      <button data-tab="conc">Conc</button>
       <button data-tab="edit">Edit</button>
     </nav>
     <div id="tab-players" class="tab on"></div>
     <div id="tab-kills" class="tab"></div>
     <div id="tab-chat" class="tab"></div>
     <div id="tab-sus" class="tab"></div>
+    <div id="tab-conc" class="tab">
+      <div class="section">Concussion events</div>
+      <div class="conc-log-attach">
+        <button id="concLogChoose" class="btn" disabled>Choose log for this round…</button>
+        <input id="concLogFile" type="file" accept=".log" hidden>
+        <p id="concLogStatus" class="sus-head" role="status">Open a demo, then drop its .log anywhere in the viewer.</p>
+      </div>
+      <p class="sus-head">Matched server logs identify recorded concussions. Otherwise, nearby blasts provide estimates. Timers remain estimated: Medic 7 s; everyone else 15 s by default. The viewer does not recreate the full visual effect.</p>
+      <div class="conc-settings">
+        <label><input type="checkbox" id="concShow" checked> Show on-screen indicator</label>
+        <label><input type="checkbox" id="concUseLog" checked disabled> Use matched server log when available</label>
+        <label>Blast radius (game units) <input id="concRadius" type="number" min="1" max="1000" value="280"></label>
+        <label>Medic duration (seconds) <input id="concMedic" type="number" min="1" max="60" value="7"></label>
+        <label>Other classes (seconds) <input id="concOther" type="number" min="1" max="60" value="15"></label>
+        <button id="concApply" class="btn">Apply estimates</button>
+        <button id="concReset" class="btn">Reset to stock TFC</button>
+      </div>
+      <p id="concSummary" class="sus-head">Open a TFC demo to estimate exposure.</p>
+      <div class="conc-settings">
+        <label>Hitbox margin per side (%) <input id="concAimMargin" type="number" min="0" max="200" value="10"></label>
+        <label>Assumed player screen <select id="concViewAspect"><option value="1.3333333333333333">4:3 (classic)</option><option value="1.7777777777777777">16:9 (wide)</option><option value="1.6">16:10</option></select></label>
+        <p class="sus-head">Percentages count shots only when an enemy is visible on screen. Uses the default 90° game view, adjusted for the chosen screen format. Exact player FOV and screen settings are not recorded.</p>
+        <label><input id="concDrawMargin" type="checkbox"> Draw aim margin on enemies</label>
+        <p class="sus-head">Cyan: normal boxes. Yellow: added margin. Matches the aim comparison and the Lag comp setting. Lag compensation is estimated. 30% per side makes each dimension 60% larger.</p>
+        <button id="concAimRun" class="btn">Compare firing aim by weapon</button>
+      </div>
+      <div id="concAimResults" class="sus-head"></div>
+      <div id="concEvents"></div>
+    </div>
     <div id="tab-edit" class="tab"></div>
   </aside>
 
@@ -48,6 +78,7 @@
     <div id="labels"></div>
     <div id="crosshair" class="hidden"></div>
     <div id="pov" class="hidden"></div>
+    <div id="concStatus" class="hidden" aria-live="off"><strong></strong><span></span><small></small></div>
     <div id="pip" class="hidden" title="Click to swap with the main view"><span class="nm"></span><div class="pip-bar">
       <button data-pip="eye" title="Their eyes">Eyes</button><button data-pip="chase" title="Follow them">Follow</button><button data-pip="top" title="From above">Top</button>
       <button data-pip="target" title="Show whoever the main player is aiming at">Target</button>
@@ -151,11 +182,14 @@
 
 <div id="exportVeil" class="hidden"><div class="msg">Exporting video…</div></div>
 
-<div id="drop" class="overlay hidden"><div class="panel"><h1>Drop the .dem to open it</h1></div></div>
+<div id="drop" class="overlay hidden"><div class="panel"><h1>Drop a demo or server log</h1><p>.dem opens a recording. .log attaches to the currently open round.</p></div></div>
 <script src="/web/studio.js"></script>
 <script src="/web/audio.js"></script>
 <script src="/web/fx.js"></script>
 <script src="/web/editor.js"></script>
+<script src="/web/conc.js"></script>
+<script src="/web/conc_aim.js"></script>
+<script src="/web/blood_hits.js"></script>
 <script src="/web/viewer.js"></script>
 </body>
 </html>

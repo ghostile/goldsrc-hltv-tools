@@ -393,6 +393,7 @@ class Demo:
         self._obj_ref = {}
         self.shots = []           # [t, ent, event name index]
         self.kills = []           # [t, killer ent, victim ent, weapon]
+        self.pauses = []          # svc_setpause transitions on demo and server clocks
         # the recording player's own health and armor (Health / Battery go only to that player, so a client demo has
         # them for whoever recorded it, an HLTV demo for nobody)
         self.health = []          # [t, health]
@@ -583,6 +584,9 @@ class Demo:
 
     def m_byte(self, b, seq):
         b.skip(1)
+
+    def m_setpause(self, b, seq):
+        self.pauses.append({'t': self.dtime, 'serverTime': self.time, 'paused': bool(b.byte())})
 
     def m_time(self, b, seq):
         self.time = b.float()
@@ -1231,7 +1235,7 @@ HANDLERS = {
     11: Demo.m_serverinfo, 12: Demo.m_lightstyle, 13: Demo.m_updateuserinfo, 14: Demo.m_deltadescription,
     15: Demo.m_clientdata, 16: Demo.m_short, 17: Demo.m_pings, 18: Demo.m_particle, 19: Demo.m_nop,
     20: Demo.m_spawnstatic, 21: Demo.m_event_reliable, 22: Demo.m_spawnbaseline, 23: Demo.m_temp_entity,
-    24: Demo.m_byte, 25: Demo.m_byte, 26: Demo.m_centerprint, 27: Demo.m_nop, 28: Demo.m_nop,
+    24: Demo.m_setpause, 25: Demo.m_byte, 26: Demo.m_centerprint, 27: Demo.m_nop, 28: Demo.m_nop,
     29: Demo.m_spawnstaticsound, 30: Demo.m_nop, 31: Demo.m_string, 32: Demo.m_cdtrack, 33: Demo.m_restore,
     34: Demo.m_string, 35: Demo.m_short, 36: Demo.m_decalname, 37: Demo.m_short, 38: Demo.m_short,
     39: Demo.m_newusermsg, 40: Demo.m_packetentities, 41: Demo.m_deltapacketentities, 42: Demo.m_nop,

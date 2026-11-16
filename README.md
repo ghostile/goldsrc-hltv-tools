@@ -6,6 +6,24 @@ Built and tested on **Team Fortress Classic**. Half-Life, Counter-Strike 1.6, Da
 
 Everything is Python's standard library plus a web page. Nothing is installed into the game, and the game's files are read straight from your own Half-Life folder (none are included here).
 
+## Concussion analysis edition
+
+This copy extends [lazydaydreamer12-collab/goldsrc-hltv-tools](https://github.com/lazydaydreamer12-collab/goldsrc-hltv-tools) with a Conc tab, per-round server-log attachment, pause-aware concussion estimates, weapon-based firing comparisons, and visible aim-margin overlays. Original history, credits and licences are retained.
+
+Open a demo, open **Conc**, then drag its server `.log` onto the viewer or choose **Choose log for this round**. The viewer validates the pairing before saving it locally. Select a player and run the firing comparison. Set the assumed player screen format and aim margin as needed. **Draw aim margin on enemies** shows cyan normal hitboxes and yellow padded boxes.
+
+Aim-near percentages count recorded firing events whose reconstructed aim enters a visible enemy's padded hitboxes, divided by eligible firing events with an enemy in view. They are not bullet accuracy. Strict and inclusive hit-evidence results separately associate firing, blood, damage and kill records; inferred associations can be wrong. Concussion durations, screen visibility and lag compensation are estimates. These results do not establish cheating.
+
+See [Concussion analysis details](docs/concussion_estimate.md) for matching rules, timing uncertainty, counts and limitations. Demos, server logs, game assets and private test recordings are not included.
+
+Run the synthetic regression checks with Node.js (only needed for testing):
+
+```sh
+node tests/test_conc_pause.cjs
+node tests/test_blood_hits.cjs
+node tests/test_visible_shots.cjs
+```
+
 ## What it does
 
 **Recorder** (`Record HLTV.bat`)
@@ -46,7 +64,7 @@ Everything is Python's standard library plus a web page. Nothing is installed in
 1. Install Python from [python.org](https://www.python.org/downloads/windows/). The installer's **py launcher** option (on by default) is enough. Also ticking "Add python.exe to PATH" does no harm.
 2. Download this repository (**Code → Download ZIP**, then unzip it anywhere) or clone it:
    ```
-   git clone https://github.com/lazydaydreamer12-collab/goldsrc-hltv-tools.git
+   git clone https://github.com/ghostile/goldsrc-hltv-tools.git
    ```
 3. Open `hltv_recorder.ini` in a text editor and check `halflife_dir`. It must be your Half-Life folder, the one with `hltv.exe` and `hl.exe` in it. The default is Steam's standard location. If Steam keeps your games elsewhere, it's the `steamapps\common\Half-Life` folder of that library.
 

@@ -20,3 +20,12 @@ plugin/**/obj/
 *.pdb
 *.user
 .vs/
+
+# Local credentials and development environments
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.venv/
+node_modules/

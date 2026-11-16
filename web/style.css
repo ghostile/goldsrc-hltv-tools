@@ -203,6 +203,25 @@ dd { margin: 0; }
 .ed-range { font-size: 12.5px; }
 .ed-range b { color: var(--accent); font-weight: 600; }
 #pov .vit { color: #ffb347; font-weight: 600; }
+#concStatus { position: absolute; top: 12px; left: 12px; max-width: 310px; padding: 10px 13px;
+  background: rgba(15,18,24,.91); border: 1px solid #687383; border-radius: 6px; pointer-events: none; }
+#concStatus strong, #concStatus span, #concStatus small { display: block; }
+#concStatus strong { font-size: 14px; }
+#concStatus span { margin-top: 4px; font-size: 13px; }
+#concStatus small { color: #c2cad6; margin-top: 4px; font-size: 11px; }
+#concStatus.active { border-color: #ffbf47; background: rgba(57,37,8,.94); }
+#concStatus.active strong { color: #ffd479; }
+.conc-settings { padding: 8px; display: grid; gap: 8px; font-size: 12px; }
+.conc-settings label { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.conc-settings input[type=number] { width: 64px; background: var(--panel2); color: var(--text); border: 1px solid var(--line); padding: 4px; }
+.conc-aim-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.conc-log-attach { padding: 8px; border-bottom: 1px solid var(--line); }
+#concLogStatus.error { color: #ffb08e; }
+.conc-aim-table th, .conc-aim-table td { padding: 5px 3px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+.conc-blood-table { table-layout: fixed; }
+.conc-blood-table th, .conc-blood-table td { overflow-wrap: anywhere; }
+.conc-count { white-space: nowrap; }
+#concAimResults .btn { max-width: 100%; white-space: normal; text-align: left; }
 .ed-q { margin-top: 5px; color: #7fd08f; }
 .ed-q.warn { color: #ffb347; }
 

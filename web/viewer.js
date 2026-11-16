@@ -343,6 +343,8 @@ async function openDemo(id) {
     S.D = buildData(meta, buf);
     S.meta = meta;
     S.id = id;
+    S.concLog = null;
+    try { S.concLog = await fetchJSON(`/api/demo/${id}/conc-log`); } catch (e) { /* estimates remain available */ }
     S.maps = {};
     S.mapErrors = {};
     for (const name of [...new Set(meta.levels.map(l => l.map))]) {
@@ -397,6 +399,23 @@ function buildData(meta, buf) {
     D.traceShots.push({ t, s: e, range: EV_MELEE.test(name) ? 64 : 8192, weapon: name.replace(/^.*\/|\.sc$/g, '') });
   }
   D.buf = buf;
+  // Both TFC launchers share p_glauncher/v_tfgl. Their firing events identify the mode.
+  // Read the full event stream (including reliable events), not only meta.shots.
+  D.launcherShots = new Map();
+  if (L.events) {
+    const E = F('events'), levels = meta.levels?.length ? meta.levels : [{ t: meta.start, events: meta.events }];
+    for (let o = 0; o + 15 < E.length; o += 16) {
+      const t = E[o], s = E[o + 1];
+      let li = levels.length - 1;
+      while (li > 0 && levels[li].t > t) li--;
+      const match = /(?:^|\/)wpn\/tf_(gl|pipel)\.sc$/i.exec(levels[li].events?.[E[o + 2]] || '');
+      if (!match || !D.info[s]) continue;
+      let list = D.launcherShots.get(s);
+      if (!list) D.launcherShots.set(s, list = []);
+      list.push({ t, mode: match[1].toLowerCase() === 'pipel' ? 'p' : 'g' });
+    }
+    for (const list of D.launcherShots.values()) list.sort((a, b) => a.t - b.t);
+  }
   return D;
 }
 
@@ -663,6 +682,7 @@ function render() {
   if (rs) return;                             // exporting: the video's overlays are drawn by the editor
   drawLabels(VP, players, cam, aimInfo, w / dpr, h / dpr);
   updatePov(players, cam, aimInfo);
+  updateConcIndicator(cam.pov ? cam.pov.s : S.sel);
   updateFeeds();
   updatePipBox(h, dpr);
 }
@@ -684,6 +704,7 @@ function drawScene(VP, cam, players, poses, objs, i, aspect, view) {
   if (S.map) drawTranslucent(VP, trans);
   FX.draw(VP, cam, objs);
   if (prefs.hitboxes) drawHitboxes(VP, players, cam, i);
+  if ($('#concDrawMargin').checked) drawConcMargin(VP, cam, i);
   const aimInfo = drawLines(VP, players, cam, i);
   if (view) drawViewModel(view, cam, aspect);
   return aimInfo;
@@ -1266,8 +1287,92 @@ function hitboxMatrix(B, h) {
     (x36 ducked) for a player whose model is missing. In Eyes view they are where the server tests that player's shots
     (lag compensation moves them back for a human). Boxes a shot just went through flash; a shot tested against boxes
     other than the drawn ones (another human's rewind) flashes the box it went through where it was tested. */
+function concMarginValue() {
+  const value=Number($('#concAimMargin').value);
+  return Math.max(0,Math.min(200,Number.isFinite(value)?value:0))/100;
+}
+function concTargetAt(slot, fi, shooter = 0) {
+  let q=playerState(slot,fi,0), qi=fi;
+  if (!alive(q) && fi>0 && S.meta.kills.some(k=>k[2]===slot&&k[0]>=S.D.times[fi-1]&&k[0]<=S.D.times[fi]+.01)) {
+    const prev=playerState(slot,fi-1,0);
+    if (alive(prev)) {
+      if(q?.dead){prev.x=q.x;prev.y=q.y;prev.z=q.z;}
+      q=prev;qi=fi-1;
+    }
+  }
+  // One target-position basis for the margin, its display, and shot matching.
+  // A victim dying in this packet uses the preceding alive snapshot, matching
+  // the existing shot-hit reconstruction's death handling.
+  if(alive(q)&&shooter) q=unlagState(q,S.D.times[qi],unlagFor(shooter,S.D.times[fi]));
+  return {q,qi};
+}
+function drawConcMargin(VP, cam, i) {
+  const p=playerState(S.sel,i,0);
+  if(!alive(p))return;
+  const v=[],margin=concMarginValue();
+  for(const s of S.D.slots){
+    const {q,qi}=concTargetAt(s,i,S.sel);
+    if(!alive(q)||!enemies(p,q)||(cam.pov&&cam.pov.s===s))continue;
+    const pose=serverPose(q,qi,'conc-margin-draw');
+    if(!pose)continue;
+    for(const h of pose.M.meta.hitboxes){
+      pushBoxEdges(v,Studio.hitboxCorners(ConcAim.expanded(h,margin),pose.bones,cornerBuf),[1,.8,.05],.9);
+      pushBoxEdges(v,Studio.hitboxCorners(h,pose.bones,cornerBuf),[.05,.9,1],.95);
+    }
+  }
+  if(prefs.xray)drawLineVerts(VP,v,false,0,.25);
+  drawLineVerts(VP,v,true,24);
+}
+function shotVisibilityCheck(aspect) {
+  const cache=new Map();
+  return shot=>{
+    const key=`${shot.slot}:${shot.t}`;
+    if(cache.has(key))return cache.get(key);
+    const fi=ConcAim.eventFrame(S.D.times,shot.t),p=fi>=0?playerState(shot.slot,fi,0):null;
+    const result={state:'unknown',targets:[]};
+    if(!alive(p)||!p.cls||!mapForFrame(fi)||shot.t-S.D.times[fi]>.25){cache.set(key,result);return result;}
+    const eye=eyeOf(p),dir=forward(p.pitch,p.yaw),y=p.yaw*DEG,right=[Math.sin(y),-Math.cos(y),0];
+    const basis={forward:dir,right,up:cross(right,dir)};
+    let missing=false;
+    for(const s of S.D.slots){
+      // The estimated screen view belongs to the shooter, regardless of gun.
+      // Projectile aim tracing can still use current target positions later.
+      const {q,qi}=concTargetAt(s,fi,shot.slot);
+      if(!alive(q)||!enemies(p,q)||vlen(sub(chestOf(q),eye))>3500)continue;
+      const pose=serverPose(q,qi,'conc-screen');
+      if(!pose){missing=true;continue;}
+      const clear=point=>{const fraction=traceLine(eye,point,fi);return fraction<0||fraction>.995;};
+      if(pose.M.meta.hitboxes.some(h=>ConcAim.visibleBox(Studio.hitboxCorners(h,pose.bones,new Float64Array(24)),eye,basis,aspect,clear)))result.targets.push(s);
+    }
+    result.state=result.targets.length?'visible':missing?'unknown':'not-visible';
+    cache.set(key,result);return result;
+  };
+}
+function marginShotCheck(margin, visibility) {
+  const cache=new Map();
+  return (shot,victim)=>{
+    const key=`${shot.id}:${victim}`;
+    if(cache.has(key))return cache.get(key);
+    if(visibility&&!visibility(shot).targets.includes(victim)){cache.set(key,false);return false;}
+    const fi=ConcAim.eventFrame(S.D.times,shot.t),p=fi>=0?playerState(shot.slot,fi,0):null;
+    let near=false;
+    if(alive(p)&&mapForFrame(fi)&&shot.t-S.D.times[fi]<=.25){
+      const {q,qi}=concTargetAt(victim,fi,shot.slot);
+      if(alive(q)&&enemies(p,q)){
+        const eye=eyeOf(p),dir=forward(p.pitch,p.yaw),v=sub(chestOf(q),eye),dist=vlen(v);
+        if(dist>0&&dist<=3500&&(visibility||canSee(eye,q,fi))){
+          const wall=traceLine(eye,addv(eye,mulv(dir,3500)),fi),limit=wall<0?3500:wall*3500;
+          const pose=serverPose(q,qi,'conc-margin-match');
+          near=!!pose&&pose.M.meta.hitboxes.some(h=>ConcAim.rayHit(ConcAim.expanded(h,margin),pose.bones,eye,dir,limit));
+        }
+      }
+    }
+    cache.set(key,near);return near;
+  };
+}
 function drawHitboxes(VP, players, cam, i) {
-  const rw = cam.pov ? unlagFor(cam.pov.s, S.t) : 0;
+  const shooter=cam.pov?.s||($('#concDrawMargin').checked?S.sel:0);
+  const rw = shooter ? unlagFor(shooter, S.D.times[i]) : 0;
   const flash = new Map(), ghosts = [];
   for (const k of recentTraceShots(S.t, 0.35)) {
     const r = shotHit(k);
@@ -1290,8 +1395,9 @@ function drawHitboxes(VP, players, cam, i) {
   }
   for (const p0 of players) {
     if (!alive(p0) || (cam.pov && cam.pov.s === p0.s)) continue;
-    const p = rw > 0 ? unlagState(p0, S.t, rw) : p0;
-    const sp = serverPose(p, i, p.s);
+    const {q:p,qi}=concTargetAt(p0.s,i,shooter);
+    if(!alive(p))continue;
+    const sp = serverPose(p, qi, p.s);
     if (!sp) {
       const hz = p.ducked ? 18 : 36;
       for (let k = 0; k < 8; k++) {
@@ -1435,6 +1541,24 @@ function lastShotBefore(s, t) {
   while (lo <= hi) { const m = (lo + hi) >> 1; if (a[m] <= t) { best = a[m]; lo = m + 1; } else hi = m - 1; }
   return best;
 }
+function lastLauncherShot(p, t) {
+  const list = S.D.launcherShots.get(p.s) || [];
+  let lo = 0, hi = list.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (list[mid].t <= t) lo = mid + 1; else hi = mid; }
+  const shot = list[lo - 1];
+  if (!shot || shot.t < levelForFrame(S.fi).t) return null;
+  // Don't reuse a mode across another weapon, a death, a missing track or a new player.
+  const I = S.D.info[p.s], start = frameAt(shot.t)[0], end = frameAt(t)[0];
+  for (let i = start; i <= end; i++) {
+    const a = I[i];
+    if (!(a & PF_PRESENT) || (a & (PF_DEAD | PF_NODRAW | PF_OBSERVER)) ||
+        ((a >> 12) & 1023) !== p.wm || ((a >> 8) & 15) !== ((I[end] >> 8) & 15) ||
+        (i > start && S.D.times[i] - S.D.times[i - 1] > .25)) return null;
+  }
+  if ((S.D.byEnt[p.s] || []).some(pl => pl.first > shot.t && pl.first <= t)) return null;
+  if (S.meta.kills.some(k => k[2] === p.s && k[0] >= shot.t && k[0] <= t)) return null;
+  return shot;
+}
 function poseViewModel(cam = lastCam, key = 'view') {
   if (!cam || !cam.pov || cam.pov.dead || cam.pov.hidden) return null;
   const p = cam.pov, path = viewModelPath(p);
@@ -1445,11 +1569,20 @@ function poseViewModel(cam = lastCam, key = 'view') {
     M.shootSeq = Studio.findSequence(M, /shoot|fire|attack|slash|swing|stab|hit|spin/i);
     M.idleSeq = Math.max(0, Studio.findSequence(M, /^idle/i));
   }
-  let seq = M.idleSeq, elapsed = S.t;
-  const ts = lastShotBefore(p.s, S.t);
-  if (ts >= 0 && M.shootSeq >= 0) {
-    const sq = M.seqs[M.shootSeq];
-    if (S.t - ts < sq.frames / Math.max(1, sq.fps)) { seq = M.shootSeq; elapsed = S.t - ts; }
+  let idleSeq = M.idleSeq, shootSeq = M.shootSeq, ts = lastShotBefore(p.s, S.t);
+  if (isTFC() && /\/v_tfgl\.mdl$/i.test(path)) {
+    const shot = lastLauncherShot(p, S.t), mode = shot?.mode || 'g';
+    // Unknown until a shot is recorded: retain the default, never infer from a future shot.
+    const idle = Studio.findSequence(M, new RegExp(`^${mode}idle$`, 'i'));
+    const fire = Studio.findSequence(M, new RegExp(`^${mode}fire$`, 'i'));
+    if (idle >= 0) idleSeq = idle;
+    if (fire >= 0) shootSeq = fire;
+    ts = shot?.t ?? -1;
+  }
+  let seq = idleSeq, elapsed = S.t;
+  if (ts >= 0 && shootSeq >= 0) {
+    const sq = M.seqs[shootSeq];
+    if (S.t - ts < sq.frames / Math.max(1, sq.fps)) { seq = shootSeq; elapsed = S.t - ts; }
   }
   let pose = poseStore.get(key);
   if (!pose) poseStore.set(key, pose = Studio.newPose());
@@ -1908,6 +2041,8 @@ function setUnlag(on) {
   savePrefs();
   $('#optUnlag').checked = prefs.unlag;
   shotHitCache.clear();
+  S.concAim=null;
+  $('#concAimResults').textContent='Lag compensation changed. Run the comparison again to update the results.';
   if (S.D) runAnalysis();
   const b = $('#banner');
   b.textContent = prefs.unlag ? 'Lag compensation on: humans\' shots are tested where the others were on their screen.'
@@ -1918,10 +2053,247 @@ function setUnlag(on) {
 }
 
 function selectPlayer(s, mode) {
+  if (S.sel !== s) { S.concAim = null; $('#concAimResults').textContent = ''; }
   S.sel = s;
   if (mode) setMode(mode);
   S.orbit.manual = false;
   refreshPanels(true);
+  renderConcList();
+}
+
+let logUploadPending=false;
+function renderLogAttachment() {
+  $('#concLogChoose').disabled=!S.D||logUploadPending;
+  const el=$('#concLogStatus'),notice=S.logNotice?.demo===S.id?S.logNotice:null;
+  el.classList.toggle('error',!!notice?.error);
+  if(notice?.busy||notice?.error){el.textContent=notice.message;return;}
+  const log=S.concLog;
+  if(!log?.alignment){el.textContent='Drop this round’s .log anywhere in the viewer, or choose it above. The pairing is saved with this demo.';return;}
+  const a=log.alignment,pauses=a.pauses||[];
+  let pauseNote='';
+  if(pauses.length)pauseNote=pauses.every(p=>p.checked)?' Pause timing checked.':' Some pause boundaries lack enough kills to verify separately.';
+  el.textContent=`Attached: ${log.log}. ${a.anchors}/${a.eligibleKills} player kills matched; timing approximately ±${a.uncertainty} s.${pauseNote} Saved for this demo. Drop another log to replace it after verification.`;
+}
+async function attachServerLog(file) {
+  if(!S.D||!S.id){alert('Open the round’s demo first, then drop its .log.');return;}
+  if(logUploadPending)return;
+  const id=S.id;
+  setTab('conc');
+  if(!/\.log$/i.test(file.name)||file.size>16*1024*1024){
+    S.logNotice={demo:id,error:true,message:'Choose a .log file up to 16 MB.'};renderLogAttachment();return;
+  }
+  logUploadPending=true;
+  S.logNotice={demo:id,busy:true,message:`Matching ${file.name} to ${S.meta.file}…`};
+  renderLogAttachment();
+  try{
+    const log=await fetchJSON(`/api/demo/${encodeURIComponent(id)}/conc-log?name=${encodeURIComponent(file.name)}`,{method:'POST',body:file});
+    if(S.id===id){
+      S.concLog=log;S.logNotice=null;$('#concUseLog').checked=true;rebuildConc();drawTimeline();
+    }
+  }catch(err){
+    if(S.id===id)S.logNotice={demo:id,error:true,message:`Log not attached: ${err.message}${S.concLog?.events?' Your existing log is unchanged.':''}`};
+  }finally{logUploadPending=false;renderLogAttachment();}
+}
+// Concussion is estimated independently of aim/cheat review scores.
+function rebuildConc() {
+  if (!S.D) return;
+  renderLogAttachment();
+  S.concAim = null;
+  $('#concAimResults').textContent = '';
+  S.conc = ConcEstimate.build(S.meta, S.D, { radius: $('#concRadius').value, medic: $('#concMedic').value, other: $('#concOther').value });
+  if ($('#concUseLog').checked) S.conc = ConcEstimate.withLog(S.meta, S.D, S.conc, S.concLog);
+  $('#concUseLog').disabled = !S.concLog?.events;
+  $('#concRadius').value = S.conc.settings.radius;
+  $('#concMedic').value = S.conc.settings.medic;
+  $('#concOther').value = S.conc.settings.other;
+  renderConcList();
+}
+function renderConcList() {
+  if (!S.conc) return;
+  const list = S.conc.bySlot[S.sel] || [];
+  if (S.conc.log) {
+    $('#concSummary').textContent = `${list.length} server-logged concussion events for ${nameOf(S.sel, S.t)}. ${S.conc.log.log}: aligned using ${S.conc.log.alignment.anchors} matching kills; timing approximately ±${S.conc.log.alignment.uncertainty} s. Purple bands show estimated duration, not measured client-side effects.`;
+    $('#concEvents').innerHTML = list.length ? list.map(e => `<div class="sus-item" data-t="${e.t}" data-p="${S.sel}"><span class="t">${fmtTime(e.t - S.meta.start)}</span><span>Logged conc · ${e.self ? 'self' : esc(e.source)}<br><small>${esc(e.clock)} · log line ${e.line}<br>${e.duration} s estimated timer; window ends ${fmtTime(e.end - S.meta.start)}</small></span></div>`).join('')
+      : '<p class="sus-head">No concussion events for this player in the matched log.</p>';
+    return;
+  }
+  $('#concSummary').textContent = `${list.length} estimated times affected for ${nameOf(S.sel, S.t)} — not grenades used. Includes nearby blasts from any player; the thrower is not identified. ${S.conc.blasts} conc blasts recorded across the demo; ${S.conc.unlocated} without a usable position. Purple timeline bands show estimated windows for the selected player.`;
+  $('#concEvents').innerHTML = list.length ? list.map(e => `<div class="sus-item" data-t="${e.t}" data-p="${S.sel}"><span class="t">${fmtTime(e.t - S.meta.start)}</span><span>Possible conc · ${Math.round(e.distance)} units from blast<br><small>${e.cls === 5 ? 'Medic' : esc(className(e.cls))}: ${e.duration} s timer; window ends ${fmtTime(e.end - S.meta.start)}</small></span></div>`).join('')
+    : '<p class="sus-head">No nearby blasts detected for this player. This does not establish that they were never concussed.</p>';
+}
+function updateConcIndicator(slot) {
+  const el = $('#concStatus');
+  el.classList.toggle('hidden', !S.conc || !$('#concShow').checked || !/^tfc/i.test(S.meta?.game || '') || !slot);
+  if (!S.conc) return;
+  const hit = ConcEstimate.active(S.conc, slot, S.t);
+  const paused = S.conc.pauses?.some(([a, b]) => S.t >= a && S.t < b);
+  el.classList.toggle('active', !!hit);
+  el.querySelector('strong').textContent = hit ? (hit.logged ? 'LOGGED CONC · ESTIMATED TIMER' : 'POSSIBLY CONCUSSED') : 'CONC STATUS: UNKNOWN';
+  el.querySelector('span').textContent = `${nameOf(slot, S.t)}${hit ? ` · ~${ConcEstimate.remaining(hit, S.t).toFixed(1)} s remaining${paused ? ' · game paused' : ''}` : ' · no active estimate'}`;
+  el.querySelector('small').textContent = hit?.logged ? `${className(hit.cls)} · ${hit.duration} s estimated duration · log line ${hit.line} · timing ±${S.conc.log.alignment.uncertainty} s`
+    : hit ? `Estimated from blast ${Math.round(hit.distance)} units away · ${hit.cls === 5 ? 'Medic' : 'other class'} timer`
+    : S.conc.log ? 'Server-log event times; duration estimated · settings in Conc tab' : 'Nearby-blast estimate only · settings in Conc tab';
+}
+
+function bloodLocator(D) {
+  const cache=new Map();
+  return (blood, tolerance, shot) => {
+    const shooter=shot&&BloodHits.isHitscan(shot.weapon)?shot.slot:0;
+    const t=shooter?shot.t:blood.t,fi=ConcAim.eventFrame(D.times,t);
+    if (fi < 0 || t - D.times[fi] > .25) return {slots:[],missing:true};
+    const key=`${fi}:${shooter}`;
+    let candidates=cache.get(key);
+    if (!candidates) {
+      candidates=[];
+      for (const s of D.slots) {
+        const {q,qi}=concTargetAt(s,fi,shooter);
+        if (!alive(q)) continue;
+        const poses=[];
+        for (const j of [...new Set([fi, Math.max(0,fi-1)])]) {
+          if (D.times[fi]-D.times[j]>.25) continue;
+          const {q:p,qi:pi}=concTargetAt(s,j,shooter);
+          if (!alive(p) || p.cls!==q.cls || Math.hypot(p.x-q.x,p.y-q.y,p.z-q.z)>128) continue;
+          const pose=serverPose(p,pi,'blood-match');
+          if (pose) poses.push({boxes:pose.M.meta.hitboxes,bones:pose.bones.slice()});
+        }
+        candidates.push({slot:s,q,poses});
+      }
+      if(cache.size>32)cache.clear();
+      cache.set(key,candidates);
+    }
+    const slots=[]; let missing=false;
+    for (const c of candidates) {
+      if (!c.poses.length) {
+        if (Math.hypot(c.q.x-blood.pos[0],c.q.y-blood.pos[1],c.q.z-blood.pos[2])<128) {slots.push(c.slot);missing=true;}
+        continue;
+      }
+      if (c.poses.some(p=>p.boxes.some(h=>BloodHits.pointDistance(h,p.bones,blood.pos)<=tolerance))) slots.push(c.slot);
+    }
+    return {slots,missing};
+  };
+}
+function renderBloodHits(result, slot) {
+  let html='<b>Shots with hit evidence · enemy in view</b><p>Only shots fired with an enemy visible on the reconstructed screen count in these percentages. Combines recorded kills with blood effects and server-log damage. Each firing event counts once, even when several pellets or targets are involved. Blood + damage matches are inferred; the percentage below is the share of enemy-visible shots with identified hit evidence, not complete shooting accuracy.</p>';
+  html+='<table class="conc-aim-table conc-blood-table"><thead><tr><th>Weapon</th><th>Conc</th><th>Non-conc*</th><th>Timing uncertain</th></tr></thead><tbody>';
+  for (const row of Object.values(result.rows)) {
+    html+=`<tr><td>${esc(row.label)}</td>${['conc','outside','uncertain'].map(state=>{
+      const b=row[state];
+      return `<td><small>Strict:</small><br><b class="conc-count">${b.identified} / ${b.fired}</b><br>${b.identifiedPercent==null?'—':b.identifiedPercent.toFixed(1)+'%'}<br><small>Inclusive:</small><br><b class="conc-count">${b.inclusive} / ${b.fired}</b><br>${b.inclusivePercent==null?'—':b.inclusivePercent.toFixed(1)+'% estimated'}<br><small>${b.plausibleAdditional} extra plausible<br>${b.killConfirmed} kill-confirmed<br>${b.bloodDamage} blood + damage<br>${b.ambiguous} ambiguous<br>${b.unmatched} no match<br>${b.excludedNoEnemy} no enemy (excluded)${b.visibilityUnknown?`<br>${b.visibilityUnknown} visibility unknown (excluded)`:""}</small></td>`;
+    }).join('')}</tr>`;
+  }
+  html+='</tbody></table><p><b>No match does not mean a miss.</b> Missing firing events, blood effects or position data can prevent a match. The inclusive estimate adds plausible blood/damage matches whose aim is within your margin; the strict count does not. Damage is recorded, but the shot attribution can still be wrong. Shots with no enemy in view are excluded from both the numerator and denominator, including any associated hits. Concussion state is evaluated when firing. <b>Timing uncertain</b> means unsure whether the player was concussed, not unsure whether logged damage happened.</p>';
+  if (result.unpairedKills.length) {
+    html+=`<p><b>${result.unpairedKills.length} recorded hitscan kills could not be paired with one firing event.</b> They remain in the kill totals below and are not added to the shot denominator.</p>`;
+    for (const k of result.unpairedKills) html+=`<button class="btn" data-conc-aim-t="${k.t}" data-p="${slot}">Unpaired kill ${fmtTime(k.t-S.meta.start)} · ${esc(k.weapon)} · ${esc(k.reason)}</button> `;
+  }
+  html+=`<details><summary>Matching rules and evidence</summary><p>Blood must be within ${result.spatialTolerance} game units of a reconstructed target hitbox at the candidate shooter's firing time (using the Lag comp setting), or its preceding snapshot, and within ${(result.shotTolerance*1000).toFixed(0)} ms of a recorded firing event. Log damage must name that attacker and victim within ±${result.logTolerance} s. Competing shots, shared damage rows, uncertain targets and nearby recorded explosions prevent a unique blood + damage match. Visibility uses normal hitboxes, the selected screen format, recorded view angles, map walls and the Lag comp setting. X-ray and margin size cannot make a hidden enemy visible. The inclusive estimate allows competing-shot and nearby-explosion cases when aim is inside the selected margin. It assigns each blood effect and damage row to at most one shot, preferring the nearest blood/firing time, and counts each shot once. It never includes missing/overlapping targets or conflicting kill weapons. Earlier projectiles and missing records can still cause incorrect attribution. Rockets and other projectiles are not scored here.</p><p>${result.audit.bloodEffects} blood effects inspected across the round. Blood effects are not pellet counts.</p></details>`;
+  html+='<button class="btn" id="concBloodExport">Download shot evidence CSV</button><details><summary>Review matched and ambiguous shots</summary>';
+  for (const shot of result.shots.filter(s=>s.status!=='unmatched')) {
+    html+=`<div><button class="btn" data-conc-aim-t="${shot.t}" data-p="${slot}">${fmtTime(shot.t-S.meta.start)} · ${esc(shot.label)} · ${shot.inclusiveMatch?'plausible (inclusive)':esc(shot.status)} · ${esc(shot.state)}${shot.includedInPercentage?'':' · excluded: '+(shot.visibility==='not-visible'?'no enemy in view':'visibility unknown')}</button><small>${shot.damageLines.length?' log lines '+shot.damageLines.join(', '):''}${shot.reasons.length?' · '+esc(shot.reasons.join('; ')):''}</small></div>`;
+  }
+  return html+'</details><hr>';
+}
+function exportBloodEvidence(result) {
+  const headers=['demo_seconds','weapon','conc_state','evidence','blood_event_ids','damage_log_lines','victim_slots','kill_times','ambiguity_reasons','candidate_blood_ids','candidate_damage_lines','inclusive_blood_id','inclusive_damage_line','inclusive_victim','included_in_percentage','visibility','visible_enemy_slots'];
+  const quote=x=>'"'+String(x??'').replaceAll('"','""')+'"';
+  const rows=result.shots.map(s=>[s.t,s.weapon,s.state,s.status,s.bloodIds.join(';'),s.damageLines.join(';'),s.victims.join(';'),s.killTimes.join(';'),s.reasons.join(';'),s.candidateBloodIds.join(';'),s.candidateDamageLines.join(';'),s.inclusiveMatch?.bloodId,s.inclusiveMatch?.damageLine,s.inclusiveMatch?.victim,s.includedInPercentage,s.visibility,s.visibleTargets.join(';')]);
+  const blob=new Blob([[headers,...rows].map(r=>r.map(quote).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'});
+  const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='shot-hit-evidence.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+// Aim proximity at recorded firing events; weapon identity comes from the firing event.
+async function runConcAim() {
+  const box = $('#concAimResults');
+  if (!S.conc?.log) { box.textContent = 'Enable a matched server log to compare concussion periods.'; return; }
+  if (!Object.values(S.maps).some(Boolean)) { box.textContent = 'The map is needed to exclude aim through walls.'; return; }
+  const margin = concMarginValue();
+  $('#concAimMargin').value = margin * 100;
+  const slot = S.sel, D = S.D, conc = S.conc, mine = S.concAim = { slot, running: true };
+  const expanded = new Map();
+  const aspect=Number($('#concViewAspect').value)||4/3,visibility=shotVisibilityCheck(aspect);
+  const firing = ConcAim.firingEvents(S.meta, D, slot);
+  const result = await ConcAim.measure({ start: S.meta.start, end: S.meta.end, events: conc.bySlot[slot] || [],
+    fires: firing.events, combat: conc.log.combat, kills: S.meta.kills, slot, margin, uncertainty: conc.log.alignment.uncertainty,
+    cancelled: () => S.concAim !== mine || S.D !== D || S.conc !== conc,
+    progress: f => { if (S.concAim === mine) box.textContent = `Comparing ${nameOf(slot, S.t)} by weapon… ${Math.round(f * 100)}%`; },
+    sample: (t, _margin, shot) => {
+      const view=visibility(shot);
+      if(view.state==='unknown')return null;
+      if(view.state!=='visible')return {visible:false};
+      const fi = ConcAim.eventFrame(D.times, t);
+      if (fi < 0) return null;
+      const p = playerState(slot, fi, 0);
+      if (!alive(p) || !p.cls || !mapForFrame(fi) || t - D.times[fi] > .25) return null;
+      const eye = eyeOf(p), dir = forward(p.pitch, p.yaw), range = 3500;
+      const wall = traceLine(eye, addv(eye, mulv(dir, range)), fi), limit = wall < 0 ? range : wall * range;
+      let visible = false, near = false, hit = false, target = 0;
+      for (const s of view.targets) {
+        let {q,qi} = concTargetAt(s,fi,BloodHits.isHitscan(shot.weapon)?slot:0);
+        // A firing packet can already contain its victim's death. Retain their
+        // preceding pose only for a recorded death in this packet interval.
+        if (!alive(q) || !enemies(p, q)) continue;
+        const pose = serverPose(q, qi, 'conc-aim');
+        if (!pose) return null; // Missing hitboxes must not count as misses.
+        visible = true;
+        let H = expanded.get(pose.M);
+        if (!H) { H = pose.M.meta.hitboxes.map(h => ConcAim.expanded(h, margin)); expanded.set(pose.M, H); }
+        if (pose.M.meta.hitboxes.some(h => ConcAim.rayHit(h, pose.bones, eye, dir, limit))) hit = true;
+        if (H.some(h => ConcAim.rayHit(h, pose.bones, eye, dir, limit))) { near = true; target = s; }
+      }
+      return { visible, near, hit, target, sampleTime: D.times[fi] };
+    }
+  });
+  if (!result || S.concAim !== mine) return;
+  const allFires=D.slots.flatMap(s=>ConcAim.firingEvents(S.meta,D,s).events);
+  const effects=BloodHits.effects(S.meta,D);
+  result.bloodHits=await BloodHits.match({fires:allFires,...effects,combat:conc.log.combat,kills:S.meta.kills,
+    slot,events:conc.bySlot[slot]||[],stateAt:ConcAim.stateAt,locateBlood:bloodLocator(D),
+    withinMargin:marginShotCheck(margin,visibility),aimMargin:margin,shotVisibility:visibility,
+    start:S.meta.start,end:S.meta.end,uncertainty:conc.log.alignment.uncertainty,
+    cancelled:()=>S.concAim!==mine||S.D!==D||S.conc!==conc,
+    progress:f=>{if(S.concAim===mine)box.textContent=`Matching blood, shots and damage… ${Math.round(f*100)}%`;}});
+  if (!result.bloodHits || S.concAim !== mine) return;
+  result.duplicateFiringEvents = firing.duplicates;
+  result.lagCompensation={enabled:!!prefs.unlag,appliesTo:'hitscan weapons',method:'scoreboard ping + 100 ms interpolation estimate'};
+  result.bloodHits.lagCompensation=result.lagCompensation;
+  result.screenView={aspect,baseHorizontalFov:90,range:3500,visibility:'normal-hitbox faces within screen, with map line of sight'};
+  result.bloodHits.screenView=result.screenView;
+  mine.running = false; mine.result = result;
+  const pct = n => n == null ? '—' : `${n.toFixed(1)}%`;
+  let html = renderBloodHits(result.bloodHits,slot)+`<b>${esc(nameOf(slot, S.t))}: aim while firing</b><p>${margin * 100}% padding on each side of each hitbox. Only firing events with an enemy visible on the reconstructed screen count. Idle time and firing with no enemy in view are excluded. Counts: aim-near / centre-ray intersections / fired / concs. Weapon identity comes from the firing event, regardless of custom model appearance. The percentage is still aim-near / fired.</p>`;
+  html += '<table class="conc-aim-table conc-geometry-table"><thead><tr><th>Weapon</th><th>Conc</th><th>Non-conc*</th></tr></thead><tbody>';
+  const weaponOrder = ['AC', 'Shotgun', 'Super shotgun', 'Rocket launcher'];
+  for (const row of Object.values(result.rows).sort((a, b) => {
+    const ai = weaponOrder.indexOf(a.label), bi = weaponOrder.indexOf(b.label);
+    return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
+  })) {
+    html += `<tr><td>${esc(row.label)}</td>${['conc', 'outside'].map(k => `<td><b>${pct(row[k].nearPercent)}</b><br><small title="Aim-near events / normal-hitbox aim-ray intersections / firing events / distinct conc windows containing these firing events">${row[k].nearEvents} / ${row[k].shotsHit} / ${row[k].firingEvents} / ${row[k].concCount}</small><br><small>${row[k].excludedNoEnemyEvents} excluded: no enemy in view</small></td>`).join('')}</tr>`;
+  }
+  html += '</tbody></table>';
+  html += '<p><b>Centre-ray intersections (not successful shots):</b> firing events whose reconstructed aim ray intersects an enemy’s normal hitbox, without the extra margin. Uses the same snapshot and wall checks as aim-near; each firing event counts once. These are geometric intersections, not confirmed damage or pellet hits. <b>Concs:</b> distinct logged conc windows containing the counted firing events, not every conc in the match.</p>';
+  if (!Object.keys(result.rows).length) html += '<p>No usable firing events outside uncertain boundaries for this player.</p>';
+  html += '<p>Review firing examples during conc windows:</p>';
+  for (const row of Object.values(result.rows)) for (const example of row.examples.conc) {
+    html += `<button class="btn" data-conc-aim-t="${example.t}" data-p="${slot}">${esc(row.label)} · ${fmtTime(example.t - S.meta.start)} · ${esc(nameOf(example.target, example.t))}</button> `;
+  }
+  html += '<p><b>Recorded kills by weapon</b><br>Actual demo kill records. Conc state is evaluated at the kill time; uncertain boundaries stay separate. These totals include kills excluded from the aim comparison and do not depend on the aim margin.</p><table class="conc-kill-table conc-aim-table"><thead><tr><th>Weapon</th><th>Conc</th><th>Non-conc*</th><th>Uncertain</th><th>Total kills</th></tr></thead><tbody>';
+  for (const row of Object.values(result.kills)) {
+    html += `<tr><td>${esc(row.label)}</td><td>${row.conc}</td><td>${row.outside}</td><td>${row.uncertain}</td><td><b>${row.total}</b></td></tr>`;
+  }
+  html += '</tbody></table><p>Kills are not a count of all successful shots. Suicides and recorded teamkills are excluded.</p>';
+  const damage = result.damage;
+  html += `<p>Logged enemy damage entries, all weapons: <b>${damage.conc.entries}</b> during conc windows; <b>${damage.outside.entries}</b> outside; ${damage.uncertain.entries} near uncertain boundaries. Damage entries are not individual bullets and the log does not name their weapon.</p>`;
+  const links = result.damageLinks;
+  html += `<p><b>Damage timing matches — inferred</b><br>Matching the attacker and demo firing events within ±${links.tolerance} s of each logged damage entry. A single candidate means one recorded firing event fits the time, not a confirmed shot-to-damage link. Earlier projectiles or grenades can still be responsible.</p><table class="conc-aim-table conc-timing-table"><thead><tr><th>Weapon</th><th>Conc</th><th>Non-conc*</th></tr></thead><tbody>`;
+  for (const row of Object.values(links.rows)) {
+    html += `<tr><td>${esc(row.label)}</td>${['conc', 'outside'].map(k => `<td>${row[k].singleCandidateShots} single-candidate firing events<br><small>${row[k].multipleCandidateDamageEntries} damage entries with multiple firing candidates</small></td>`).join('')}</tr>`;
+  }
+  html += `</tbody></table><p>${links.mixedOrProjectileEntries} entries had mixed-weapon or projectile candidates; ${links.noCandidateEntries} had no nearby firing event; ${links.uncertainEntries} were excluded near timing boundaries. These are not pellet counts or an accuracy percentage.</p>`;
+  for (const example of links.examples.filter(e => e.state === 'conc').slice(0, 8)) {
+    html += `<button class="btn" data-conc-aim-t="${example.shotTime}" data-p="${slot}">Review ${fmtTime(example.shotTime - S.meta.start)} · ${example.amount} damage to ${esc(nameOf(example.victim, example.damageTime))} · log ${example.line}</button> `;
+  }
+  html += `<p>*Non-conc means outside the estimated windows. Of ${result.recordedFiringEvents} recorded firing events, ${result.excludedBoundaryEvents} were excluded within ±${result.uncertainty} s of window starts/ends and ${result.unavailableEvents} lacked usable state/map/hitboxes, and ${result.excludedNoEnemyEvents} had no enemy in view. ${firing.duplicates} duplicate records removed. Firing with no visible enemy is excluded; missing the aim region while an enemy is visible still counts. Spin-up, reload and explosion events are excluded. A firing event can represent multiple bullets or pellets.</p><p>Target positioning: <b>${prefs.unlag?'estimated lag compensation ON':'lag compensation OFF'}</b>, shared by aim analysis, inclusive margin matching and the cyan/yellow overlay. Lag compensation uses scoreboard ping plus an assumed 100 ms interpolation; it is not the exact server trace. Event times allow 2 ms for snapshot rounding. A victim dying in the packet retains the previous alive pose. Visibility uses a rectangular default-FOV screen with the chosen aspect ratio, normal hitboxes, map line of sight and a 3500-unit range. No concussion wobble or pellet spread is reconstructed. Rockets remain separate.</p>`;
+  box.innerHTML = html;
+  $('#concBloodExport').onclick=()=>exportBloodEvidence(result.bloodHits);
 }
 
 // ------------------------------------------------------------------ review (wallhack / aim analysis)
@@ -2114,6 +2486,10 @@ function drawTimeline() {
   const X = t => (t - t0) / (t1 - t0) * w;
   c.fillStyle = '#2a2f3a'; c.fillRect(0, h / 2 - 3, w, 6);
   c.fillStyle = '#5a6272'; c.fillRect(0, h / 2 - 3, X(S.t), 6);
+  if ($('#concShow').checked && S.conc) {
+    c.fillStyle = 'rgba(186,133,255,.9)';
+    for (const e of S.conc.bySlot[S.sel] || []) c.fillRect(X(e.t), 11, Math.max(2, X(e.end) - X(e.t)), 4);
+  }
   if (S.analysis && !S.analysis.running) {
     c.fillStyle = 'rgba(240,160,48,.9)';
     for (const f of S.analysis.found) c.fillRect(X(f.t0) - 1, 2, Math.max(2, X(f.t1) - X(f.t0)), 7);
@@ -2206,6 +2582,36 @@ function addMark() {
 }
 
 function bindUI() {
+  $('#concApply').addEventListener('click', rebuildConc);
+  $('#concAimRun').addEventListener('click', runConcAim);
+  $('#concLogChoose').addEventListener('click',()=>$('#concLogFile').click());
+  $('#concLogFile').addEventListener('change',e=>{
+    const file=e.target.files?.[0];e.target.value='';if(file)attachServerLog(file);
+  });
+  $('#concAimMargin').addEventListener('input',()=>{
+    S.concAim=null;
+    $('#concAimResults').textContent='Margin changed. Run the comparison again to update the results.';
+  });
+  $('#concViewAspect').addEventListener('change',()=>{
+    S.concAim=null;$('#concAimResults').textContent='Assumed screen format changed. Run the comparison again.';
+  });
+  $('#concAimResults').addEventListener('click', e => {
+    const button = e.target.closest('[data-conc-aim-t]');
+    if (!button) return;
+    selectPlayer(+button.dataset.p, 'eye'); seek(+button.dataset.concAimT);
+  });
+  $('#concUseLog').addEventListener('change', rebuildConc);
+  $('#concReset').addEventListener('click', () => {
+    $('#concRadius').value = ConcEstimate.defaults.radius;
+    $('#concMedic').value = ConcEstimate.defaults.medic;
+    $('#concOther').value = ConcEstimate.defaults.other;
+    rebuildConc();
+  });
+  $('#concEvents').addEventListener('click', e => {
+    const row = e.target.closest('[data-t]');
+    if (!row) return;
+    selectPlayer(+row.dataset.p, 'eye'); seek(+row.dataset.t); S.playing = false;
+  });
   document.querySelectorAll('#modes button').forEach(b => b.addEventListener('click', () => setMode(b.dataset.mode)));
   document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
   const opt = (id, key) => { const el = $(id); el.checked = !!prefs[key]; el.addEventListener('change', () => { prefs[key] = el.checked; savePrefs(); }); };
@@ -2376,15 +2782,19 @@ function bindUI() {
   });
   window.addEventListener('blur', () => { S.keys = {}; });
 
-  // drag & drop a demo file
+  // A log attaches to the open demo; it must never enter the demo-upload route.
   let dragDepth = 0;
   window.addEventListener('dragenter', e => { if (e.dataTransfer?.types?.includes('Files')) { dragDepth++; $('#drop').classList.remove('hidden'); } });
   window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; $('#drop').classList.add('hidden'); } });
   window.addEventListener('dragover', e => e.preventDefault());
   window.addEventListener('drop', async e => {
     e.preventDefault(); dragDepth = 0; $('#drop').classList.add('hidden');
-    const f = e.dataTransfer?.files?.[0];
+    const files=e.dataTransfer?.files;
+    if(files?.length>1){alert('Drop one file at a time: open the demo, then drop its log.');return;}
+    const f = files?.[0];
     if (!f) return;
+    if(/\.log$/i.test(f.name)){await attachServerLog(f);return;}
+    if(!/\.dem$/i.test(f.name)){alert('Choose a .dem recording or a server .log file.');return;}
     try {
       showLoading('Uploading ' + f.name + '…', 0.02, '');
       const r = await fetchJSON('/api/upload?name=' + encodeURIComponent(f.name), { method: 'POST', body: f });
@@ -2465,6 +2875,7 @@ function startDemo() {
     for (const p of playersAt(fi, 0)) { const pl = who(p.s, S.D.times[fi]); if (alive(p) && pl && !pl.hltv) { sel = p.s; S.t = Math.max(m.start, S.D.times[fi]); break; } }
   }
   S.sel = sel || S.D.slots[0] || 0;
+  rebuildConc();
   const p0 = selectedState(playersAt(frameAt(S.t)[0], 0));
   if (p0) { S.cam.pos = [p0.x - 200, p0.y, p0.z + 80]; S.cam.yaw = 0; S.cam.pitch = 15; S.top.x = p0.x; S.top.y = p0.y; }
   else if (S.map) {

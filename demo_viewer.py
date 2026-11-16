@@ -19,6 +19,7 @@ import os
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -33,6 +34,7 @@ import gamefiles  # noqa: E402
 import goldsrc_demo  # noqa: E402
 import mdl  # noqa: E402
 import mp4mux  # noqa: E402
+import server_log  # noqa: E402
 from hltv_recorder import load_config  # noqa: E402
 
 WEB = os.path.join(HERE, 'web')
@@ -40,7 +42,8 @@ CACHE = os.path.join(HERE, 'cache')
 UPLOADS = os.path.join(CACHE, 'uploads')
 EDITS = os.path.join(HERE, 'edits')          # the Edit tab's shot lists, one JSON per demo
 EXPORTS = os.path.join(HERE, 'Exports')      # exported videos
-EXPORT_VERSION = 15
+EXPORT_VERSION = 16
+LOG_LOCK = threading.Lock()
 OBJ_COLUMNS = 24      # frame, ent, modelindex, origin, angles, flags, renderamt, team, body, skin, solid, sequence,
                       # frame byte, controller 0, controller 1, framerate, colormap (top | bottom << 8: team-coloured sentries),
                       # movetype, aiment (MOVETYPE_FOLLOW: a carried flag), rendercolor (r | g << 8 | b << 16)
@@ -176,6 +179,7 @@ def export_demo(dm):
                   or [{'t': 0.0, 'frame': 0, 'map': dm.mapname, 'models': {str(k): v for k, v in dm.models.items()}}],
         'pmodels': {str(k): v for k, v in dm.player_models.items()},
         'kills': dm.kills, 'chat': dm.chat, 'texts': dm.texts[:5000], 'shots': dm.shots,
+        'pauses': dm.pauses,
         # health and armor per slot: {"<slot>": {health: [[t, hp]], armor: [[t, ap]]}} or None
         'vitals': vitals_by_slot(dm),
         'warnings': dm.warnings[:20], 'buffers': layout,
@@ -331,6 +335,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(404, {'error': 'unknown demo'})
             if what == 'open':
                 return self.open_demo(did, path)
+            if what == 'conc-log':
+                # Offline-aligned server-log events, keyed by a known demo ID.
+                cp = os.path.join(CACHE, 'concussion', did + '.json')
+                if not os.path.exists(cp):
+                    return self.send(200, {})
+                with open(cp, 'rb') as f:
+                    return self.send(200, f.read())
             if what in ('meta', 'data'):
                 job = st.jobs.get(did)
                 if job and job.get('done'):
@@ -477,6 +488,8 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in u.path.split('/') if p]
         if not self.same_origin():
             return self.send(403, {'error': 'wrong origin'})
+        if parts[:2] == ['api', 'demo'] and len(parts) == 4 and parts[3] == 'conc-log':
+            return self.attach_log(parts[2], urllib.parse.parse_qs(u.query))
         if parts[:2] == ['api', 'edit'] and len(parts) == 3:
             path = self.edit_path(parts[2])
             if not path:
@@ -506,6 +519,54 @@ class Handler(BaseHTTPRequestHandler):
         did = demo_id(path)
         self.state.demos[did] = path
         return self.send(200, {'id': did})
+
+    def attach_log(self, did, query):
+        path = self.state.demos.get(did)
+        if path is None:
+            self.state.list_demos()
+            path = self.state.demos.get(did)
+        if path is None:
+            return self.send(404, {'error': 'Open the round’s demo before attaching its log.'})
+        name = os.path.basename(query.get('name', ['server.log'])[0].replace('\\', '/'))
+        if not name.lower().endswith('.log') or len(name) > 200:
+            return self.send(400, {'error': 'Choose a server .log file.'})
+        cp = cache_path(path, 'meta.json.gz')
+        job = self.state.jobs.get(did)
+        if job and job.get('done'):
+            meta = json.loads(gzip.decompress(job['meta']))
+        elif os.path.isfile(cp):
+            with gzip.open(cp, 'rt', encoding='utf-8') as f:
+                meta = json.load(f)
+        else:
+            return self.send(409, {'error': 'Wait for this demo to finish opening, then drop the log again.'})
+        try:
+            raw = self.body(16 << 20)
+            if not raw:
+                raise server_log.LogError('This log file is empty.')
+            matched = server_log.align_log(raw, name, meta)
+        except (server_log.LogError, ValueError) as e:
+            return self.send(422, {'error': str(e)})
+        digest = hashlib.sha256(raw).hexdigest()
+        matched['source'] = {'name': name, 'sha256': digest, 'bytes': len(raw)}
+        # Filenames supplied by the browser never determine a storage path.
+        # Keep originals by content hash; atomically replace the per-demo pairing
+        # only after the new log has passed all checks.
+        def atomic_write(target, data):
+            folder = os.path.dirname(target)
+            os.makedirs(folder, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix='.log-', dir=folder)
+            try:
+                with os.fdopen(fd, 'wb') as f:
+                    f.write(data)
+                os.replace(temporary, target)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        with LOG_LOCK:
+            atomic_write(os.path.join(CACHE, 'logs', did, digest + '.log'), raw)
+            atomic_write(os.path.join(CACHE, 'concussion', did + '.json'),
+                         json.dumps(matched, separators=(',', ':')).encode('utf-8'))
+        return self.send(200, matched)
 
     def export_file(self, name):
         """An exported video, with byte ranges so the page's video player can seek in it."""
