@@ -21,6 +21,7 @@ Run the synthetic regression checks with Node.js (only needed for testing):
 ```sh
 node tests/test_conc_pause.cjs
 node tests/test_blood_hits.cjs
+node tests/test_blood_timing.cjs
 node tests/test_visible_shots.cjs
 ```
 

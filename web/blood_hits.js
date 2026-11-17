@@ -39,6 +39,7 @@ const BloodHits = (() => {
     logTolerance = 1, spatialTolerance = 16, uncertainty = 1, withinMargin, aimMargin = null, shotVisibility, cancelled, progress }) {
     const shots = fires.filter(f => f.t >= start && f.t <= end).map((f, id) => ({...f, id})).sort((a,b)=>a.t-b.t);
     const selected = shots.filter(f => f.slot === slot && direct.has(f.weapon));
+    const byId=new Map(shots.map(s=>[s.id,s]));
     const damage = combat.filter(d => d.kind === 'damage' && d.enemy && d.amount > 0 && d.t >= start && d.t <= end)
       .map((d, id) => ({...d, id}));
     const pairs = new Map();
@@ -83,8 +84,51 @@ const BloodHits = (() => {
       if(!locatedAny)audit.unassignedBlood++;
       if(ambiguousAny)audit.ambiguousVictimBlood++;
     }
-    // A blood effect cannot credit two shots/attackers. A coarse damage timestamp
-    // cannot credit several distinct shots. No nearest-match or greedy assignment.
+    // Whole-second damage rows may be interchangeable even when blood timing
+    // separates the firing events. Permit a pooled association only if DISTINCT
+    // rows can support EVERY competing shot in the connected component. Include
+    // dirty/projectile competitors in that budget; never count their blood as
+    // clean evidence. A chosen row is a support allocation, not an exact pairing.
+    const clean=e=>!e.uncertainVictim&&!e.explosive&&!e.conflictingKill&&
+      bloodShots.get(e.blood).size===1&&direct.has(byId.get(e.shot).weapon);
+    const shotEdges=new Map();
+    for(const e of edges){if(!shotEdges.has(e.shot))shotEdges.set(e.shot,[]);shotEdges.get(e.shot).push(e);}
+    const timedEdges=new Set(),visited=new Set();
+    let pooledGroups=0,pooledShots=0;
+    for(const first of shotEdges.keys()){
+      if(visited.has(first))continue;
+      const group=[],pending=[first],rowSeen=new Set();visited.add(first);
+      while(pending.length){
+        const id=pending.pop();group.push(id);
+        for(const e of shotEdges.get(id)){
+          if(rowSeen.has(e.damage))continue;rowSeen.add(e.damage);
+          for(const other of damageShots.get(e.damage))if(!visited.has(other)){visited.add(other);pending.push(other);}
+        }
+      }
+      // Bounded work on pathological/custom logs; retain the old strict matches.
+      if(group.length>256||rowSeen.size<group.length)continue;
+      const options=new Map(),owners=new Map(),chosen=new Map();
+      for(const id of group){
+        const all=shotEdges.get(id),good=all.filter(clean),unique=new Map();
+        for(const e of good.length?good:all)if(!unique.has(e.damage))unique.set(e.damage,e);
+        options.set(id,[...unique.values()].sort((a,b)=>a.line-b.line||a.blood-b.blood));
+      }
+      function assign(id,seen){
+        for(const e of options.get(id)){
+          if(seen.has(e.damage))continue;seen.add(e.damage);
+          const owner=owners.get(e.damage);
+          if(owner===undefined||assign(owner,seen)){owners.set(e.damage,id);chosen.set(id,e);return true;}
+        }
+        return false;
+      }
+      group.sort((a,b)=>options.get(a).length-options.get(b).length||byId.get(a).t-byId.get(b).t||a-b);
+      if(!group.every(id=>assign(id,new Set())))continue;
+      let added=0;
+      for(const e of chosen.values())if(clean(e)&&damageShots.get(e.damage).size>1){timedEdges.add(e);added++;}
+      if(added){pooledGroups++;pooledShots+=added;}
+    }
+    audit.pooledGroups=pooledGroups;audit.pooledShots=pooledShots;
+    // A blood effect and an allocated damage row cannot credit multiple shots.
     for (const e of edges) {
       const r = records.get(e.shot);
       if (!r) continue;
@@ -94,10 +138,11 @@ const BloodHits = (() => {
       if (e.explosive) reasons.push('nearby explosion');
       if (e.conflictingKill) reasons.push('kill record names another weapon');
       if (bloodShots.get(e.blood).size !== 1) reasons.push('blood fits multiple shots');
-      if (damageShots.get(e.damage).size !== 1) reasons.push('damage row fits multiple shots');
+      if (damageShots.get(e.damage).size !== 1 && !timedEdges.has(e)) reasons.push('damage row fits multiple shots');
       if (!reasons.length) {
         r.status = 'blood-damage';
         r.bloodIds.push(e.blood); r.damageLines.push(e.line); r.victims.push(e.victim);
+        if(timedEdges.has(e))r.pooledLogSupport=true;
       } else {
         if (r.status === 'unmatched') r.status = 'ambiguous';
         r.reasons.push(...reasons);
@@ -118,7 +163,6 @@ const BloodHits = (() => {
     // of evidence at most once, preferring the closest blood/firing time. This
     // is an explicitly heuristic assignment, never promoted to confirmation.
     const usedBlood=new Set(),usedDamage=new Set(),assignedShots=new Set();
-    const byId=new Map(shots.map(s=>[s.id,s]));
     const confirmedShots=new Set();
     for(const [t,attacker,victim,weapon] of kills){
       if(attacker===victim||!killWeapons[weapon])continue;
@@ -129,7 +173,7 @@ const BloodHits = (() => {
       const strict=!e.uncertainVictim&&!e.explosive&&!e.conflictingKill&&
         bloodShots.get(e.blood).size===1&&damageShots.get(e.damage).size===1;
       const confirmed=confirmedShots.has(e.shot);
-      if(strict||confirmed){usedBlood.add(e.blood);usedDamage.add(e.damage);assignedShots.add(e.shot);}
+      if(strict||confirmed||timedEdges.has(e)){usedBlood.add(e.blood);usedDamage.add(e.damage);assignedShots.add(e.shot);}
     }
     if(withinMargin){
       const ordered=[...edges].sort((a,b)=>a.dt-b.dt||a.logDt-b.logDt||a.shot-b.shot||a.damage-b.damage||a.blood-b.blood);
@@ -164,7 +208,7 @@ const BloodHits = (() => {
       b.inclusivePercent=b.fired ? 100*b.inclusive/b.fired : null;
     }
     progress?.(1);
-    return {method:'blood-damage-and-kills-v4',denominator:shotVisibility?'enemy-visible-firing-events':'all-recorded-firing-events',shotTolerance,logTolerance,spatialTolerance,uncertainty,aimMargin,
+    return {method:'blood-damage-and-kills-v5',logAssociation:'distinct rows supporting separately timed blood; pooled row allocations are not exact shot-to-row links',denominator:shotVisibility?'enemy-visible-firing-events':'all-recorded-firing-events',shotTolerance,logTolerance,spatialTolerance,uncertainty,aimMargin,
       rows,shots:[...records.values()],unpairedKills,audit};
   }
   return {effects,pointDistance,match,isHitscan:weapon=>direct.has(weapon)};
